@@ -2,6 +2,8 @@
 
 import streamlit as st
 
+from questionnaire_chatbot.intent.rule_based import RuleBasedIntentParser
+from questionnaire_chatbot.intent.router import route
 from questionnaire_chatbot.actions import Action, ActionKind, execute
 from questionnaire_chatbot.survey.engine import SurveyEngine, SurveyError
 from questionnaire_chatbot.survey.models import QuestionStatus, SurveyStatus
@@ -23,53 +25,78 @@ if "survey_engine" not in st.session_state:
     st.session_state.messages = [("assistant", "안녕하세요! 가상 설문 챗봇입니다. 시작 버튼을 눌러주세요.")]
     st.session_state.ui_version = 0
     st.session_state.notice = None
+    st.session_state.last_answered_question = None
 
 
-def perform(kind, value, version):
-    """Process an event once, before rerendering; stale button events are ignored."""
+def record_result(before, user_text, text, level):
+    engine = st.session_state.survey_engine
+    st.session_state.notice = (level, text)
+    st.session_state.messages.extend([("user", user_text), ("assistant", text)])
+    state = engine.state
+    if (state.survey_status == SurveyStatus.IN_PROGRESS and
+        (before.survey_status != SurveyStatus.IN_PROGRESS or
+         before.current_question_index != state.current_question_index)):
+        question = get_question(state.current_question_index + 1)
+        st.session_state.messages.append(("assistant", f"{question.question_number}번 문항 · {question.question_text}"))
+
+
+def perform(kind, value, version, natural_text=None):
+    """One event path for buttons and natural language; ignore stale events."""
     if version != st.session_state.ui_version:
         return
     st.session_state.ui_version += 1
     engine = st.session_state.survey_engine
     before = engine.state
-    if kind == ActionKind.GOTO:
-        value = st.session_state.target_question
-    user_text = LABELS.get(value, str(value)) if kind == ActionKind.ANSWER else ACTION_LABELS[kind]
-    if kind == ActionKind.GOTO:
-        user_text = f"{value}번 문항으로 이동"
+    user_text = natural_text
     try:
+        extra_message = None
+        if natural_text is not None:
+            parsed = RuleBasedIntentParser().parse(natural_text)
+            routed = route(engine, parsed, st.session_state.last_answered_question)
+            if routed.action is None:
+                record_result(before, natural_text, routed.message, "info")
+                return
+            kind, value = routed.action.kind, routed.action.value
+            extra_message = routed.message
+        else:
+            if kind == ActionKind.GOTO and value is None:
+                value = st.session_state.target_question
+            user_text = LABELS.get(value, str(value)) if kind == ActionKind.ANSWER else ACTION_LABELS[kind]
+            if kind == ActionKind.GOTO:
+                user_text = f"{value}번 문항으로 이동"
         state = execute(engine, Action(kind, value))
-    except SurveyError as error:
-        text = str(error)
-        st.session_state.notice = ("warning", text)
-    except Exception:
-        # The engine discards failed candidate states. Do not expose raw exceptions.
-        text = "작업 처리 중 오류가 발생했습니다. 기존 응답은 유지됩니다. 다시 시도해주세요."
-        st.session_state.notice = ("error", text)
-    else:
         if kind == ActionKind.ANSWER:
             number = state.current_question_index + 1
+            st.session_state.last_answered_question = number
             old = before.answers.get(state.current_question_index)
             text = f"{number}번 응답을 ‘{LABELS[value]}’으로 저장했습니다."
             if old == value:
                 text = f"{number}번에 동일한 응답이 이미 저장되어 있습니다."
             elif old is not None:
-                text = f"{number}번 응답을 ‘{LABELS[old]}’에서 ‘{LABELS[value]}’으로 수정했습니다."
+                text = f"{number}번 응답을 ‘{LABELS[old]}’에서 ‘{LABELS[value]}’(으)로 수정했습니다."
         elif state.survey_status == SurveyStatus.REVIEW:
-            text = "최종 검토 단계입니다. 응답과 미응답 문항을 확인해주세요."
+            text = "최종 검토 단계입니다. 응답과 미응답 문항을 확인해주세요. 완료는 ‘설문 완료 확정’ 버튼으로만 확정합니다."
         elif state.survey_status == SurveyStatus.COMPLETED:
             text = "설문이 완료되었습니다. 감사합니다."
         else:
             text = f"{state.current_question_index + 1}번 문항을 표시합니다."
             if kind == ActionKind.SKIP:
                 text = f"{before.current_question_index + 1}번 문항을 건너뛰었습니다. " + text
-        st.session_state.notice = ("success", text)
-    st.session_state.messages.extend([("user", user_text), ("assistant", text)])
-    if (engine.state.survey_status == SurveyStatus.IN_PROGRESS and
-        (before.survey_status != SurveyStatus.IN_PROGRESS or
-         before.current_question_index != engine.state.current_question_index)):
-        question = get_question(engine.state.current_question_index + 1)
-        st.session_state.messages.append(("assistant", f"{question.question_number}번 문항 · {question.question_text}"))
+        if extra_message:
+            text += " " + extra_message
+        level = "success"
+    except SurveyError as error:
+        text, level = str(error), "warning"
+    except Exception:
+        text = "작업 처리 중 오류가 발생했습니다. 기존 응답은 유지됩니다. 다시 시도해주세요."
+        level = "error"
+    record_result(before, user_text, text, level)
+
+
+def submit_command(version):
+    text = st.session_state.command_input
+    if text and text.strip():
+        perform(None, None, version, natural_text=text)
 
 
 def action_button(label, kind, value=None, *, key=None, disabled=False, selected=False):
@@ -145,5 +172,7 @@ else:
         action_button("설문 계속 작성하기", ActionKind.RESUME)
         action_button("설문 완료 확정", ActionKind.FINISH, disabled=progress.unanswered > 0)
 
-st.caption("자연어 명령 기능은 다음 단계에서 구현됩니다")
-st.chat_input("자연어 명령 입력 (아직 사용할 수 없습니다)", disabled=True)
+st.caption("자연어로 이동·조회·수정을 요청할 수 있습니다. 응답은 선택지 버튼으로 입력해주세요.")
+st.chat_input("명령 입력 · 예: 다음 질문으로 넘어가 줘", key="command_input",
+              disabled=state.survey_status == SurveyStatus.NOT_STARTED,
+              on_submit=submit_command, args=(st.session_state.ui_version,))

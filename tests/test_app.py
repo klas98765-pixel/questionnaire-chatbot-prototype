@@ -32,7 +32,7 @@ class AppTests(unittest.TestCase):
         messages = list(self.app.session_state['messages'])
         self.app.run()
         self.assertEqual(self.app.session_state['messages'], messages)
-        self.assertTrue(self.app.chat_input[0].disabled)
+        self.assertFalse(self.app.chat_input[0].disabled)
 
     def test_navigation_edit_skip_and_progress(self):
         self.click('설문 시작하기')
